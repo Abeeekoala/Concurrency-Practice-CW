@@ -14,7 +14,8 @@ class HashSetCoarseGrained : public HashSetBase<T> {
       : table_(initial_capacity), size_(0) {}
 
   bool Add(T elem) final {
-    std::scoped_lock<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(
+        mutex_);  // Use unique_lock for manual unlocking
 
     size_t index = BucketIndex(elem);
     auto& bucket = table_[index];
@@ -25,6 +26,12 @@ class HashSetCoarseGrained : public HashSetBase<T> {
 
     bucket.push_back(elem);
     size_++;
+
+    if (policy()) {
+      lock.unlock();
+      resize();
+    }
+
     return true;
   }
 
@@ -65,6 +72,28 @@ class HashSetCoarseGrained : public HashSetBase<T> {
 
   size_t BucketIndex(const T& elem) const {
     return std::hash<T>()(elem) % table_.size();
+  }
+
+  bool policy() const { return size_ / table_.size() > 4; }
+
+  void resize() {
+    std::scoped_lock<std::mutex> lock(mutex_);
+
+    size_t old_capacity = table_.size();
+    size_t new_capacity = old_capacity * 2;
+
+    std::vector<std::vector<T>> old_table = table_;
+    table_.resize(new_capacity);
+    for (size_t i = 0; i < new_capacity; i++) {
+      table_[i] = std::vector<T>();
+    }
+
+    for (auto& bucket : old_table) {
+      for (const T& elem : bucket) {
+        size_t index = BucketIndex(elem);
+        table_[index].push_back(elem);
+      }
+    }
   }
 };
 
