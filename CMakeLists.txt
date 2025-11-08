@@ -61,6 +61,14 @@ add_hash_set_demo(coarse_grained)
 add_hash_set_demo(striped)
 add_hash_set_demo(refinable)
 
+add_executable(hash_set_tests
+        tests/hash_set_tests.cc
+        src/hash_set_base.h
+        src/hash_set_coarse_grained.h
+        src/hash_set_sequential.h)
+target_include_directories(hash_set_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(hash_set_tests PRIVATE Threads::Threads)
+
 add_executable(playground
         src/hash_set_base.h
         src/hash_set_coarse_grained.h
