@@ -4,6 +4,7 @@
 #include <cassert>
 #include <functional>
 #include <mutex>
+#include <atomic>
 
 #include "src/hash_set_base.h"
 
@@ -11,7 +12,9 @@ template <typename T>
 class HashSetStriped : public HashSetBase<T> {
  public:
   explicit HashSetStriped(size_t initial_capacity)
-      : table_(initial_capacity), mutexes_(initial_capacity), size_(0) {}
+      : table_(initial_capacity), mutexes_(initial_capacity) {
+        size_.store(0);
+      }
 
   bool Add(T elem) final {
     std::unique_lock<std::mutex> lock(
@@ -25,7 +28,7 @@ class HashSetStriped : public HashSetBase<T> {
     }
 
     bucket.push_back(elem);
-    size_++;
+    size_.fetch_add(1);
 
     if (policy()) {
       lock.unlock();
@@ -47,7 +50,7 @@ class HashSetStriped : public HashSetBase<T> {
     }
 
     bucket.erase(it);
-    size_--;
+    size_.fetch_sub(1);
     return true;
   }
 
@@ -61,13 +64,13 @@ class HashSetStriped : public HashSetBase<T> {
   }
 
   [[nodiscard]] size_t Size() const final {
-    return size_;
+    return size_.load();
   }
 
  private:
   std::vector<std::vector<T>> table_;
   std::vector<std::mutex> mutexes_;
-  size_t size_;
+  std::atomic<std::size_t> size_;
 
   size_t BucketIndex(const T& elem) const {
     return std::hash<T>()(elem) % table_.size();
@@ -77,7 +80,7 @@ class HashSetStriped : public HashSetBase<T> {
     return std::hash<T>()(elem) % mutexes_.size();
   }
 
-  bool policy() const { return size_ / table_.size() > 4; }
+  bool policy() const { return size_.load() / table_.size() > 4; }
 
   void resize() {
     // Lock all mutexes
