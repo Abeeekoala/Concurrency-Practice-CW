@@ -14,67 +14,74 @@
 
 // global registry for all Hazard Pointers (HP)
 class HPRegistry {
-  std::mutex mtx_; // Mutex to protect the list itself
-  std::vector<std::atomic<void*>*> all_hps_;
-
  public:
+  struct HazardNode {
+      std::atomic<void*> hp{nullptr};
+      std::atomic<HazardNode*> next{nullptr};
+      bool active{true};
+    };
+
   // on construction of thread_local HP
-  void registerHP(std::atomic<void*>* hp) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    all_hps_.push_back(hp);
+  HazardNode* registerHP() {
+    auto* node = new HazardNode();
+    HazardNode* expected = head_.load(std::memory_order_acquire);
+    // lock-free push front
+    do {
+      node->next.store(expected, std::memory_order_relaxed);
+    } while (!head_.compare_exchange_weak(
+        expected,
+        node,
+        std::memory_order_release,   // success: release
+        std::memory_order_relaxed)); // fail: relax
+    return node;
   }
 
   // on destruction of thread_local HP
-  void unregisterHP(std::atomic<void*>* hp) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    for (size_t i = 0; i < all_hps_.size(); ++i) {
-      if (all_hps_[i] == hp) {
-        // Simple swap-and-pop to remove
-        std::swap(all_hps_[i], all_hps_.back());
-        all_hps_.pop_back();
-        return;
-      }
-    }
+  void unregisterHP(HazardNode* node) {
+    node->active = false;
+    node->hp.store(nullptr, std::memory_order_release);
   }
 
   // for resize() to get a list of all active pointers
   std::vector<void*> getAllHazardousPtrs() {
-    std::vector<void*> hazardous;
-    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<void*> result;
+    HazardNode* current = head_.load(std::memory_order_acquire);
     
-    hazardous.reserve(all_hps_.size());
-    for (auto* hp_slot : all_hps_) {
-      void* ptr = hp_slot->load(std::memory_order_acquire);
-      if (ptr != nullptr) {
-        hazardous.push_back(ptr);
+    while (current != nullptr) {
+      if (current->active) {
+        void* ptr = current->hp.load(std::memory_order_acquire);
+        if (ptr != nullptr)
+          result.push_back(ptr);
       }
+      current = current->next.load(std::memory_order_acquire);
     }
-    return hazardous;
+    return result;
   }
+
+  private:
+    std::atomic<HazardNode*> head_{nullptr};
+
 };
 
 // thread_local Hazard Pointer
 class HazardPointer {
   HPRegistry& registry_;
-  std::atomic<void*> hp_{nullptr};
-
- public:
-  HazardPointer(HPRegistry& registry) : registry_(registry) {
-    registry_.registerHP(&hp_);
-  }
-  ~HazardPointer() {
-    registry_.unregisterHP(&hp_);
-  }
+  HPRegistry::HazardNode* node_;
   
-  // Make HazardPointer non-copyable/movable
-  HazardPointer(const HazardPointer&) = delete;
-  HazardPointer& operator=(const HazardPointer&) = delete;
+  public:
+  explicit HazardPointer(HPRegistry& registry)
+      : registry_(registry), node_(registry_.registerHP()) {}
 
-  void set(void* ptr) {
-    hp_.store(ptr, std::memory_order_release);
+  ~HazardPointer() {
+    registry_.unregisterHP(node_);
   }
-  void clear() {
-    hp_.store(nullptr, std::memory_order_release);
+
+  void set(void* ptr) noexcept {
+    node_->hp.store(ptr, std::memory_order_release);
+  }
+
+  void clear() noexcept {
+    node_->hp.store(nullptr, std::memory_order_release);
   }
 };
 
@@ -153,26 +160,20 @@ class HashSetRefinable : public HashSetBase<T> {
   // Accessors for shared hazard pointer state. We intentionally leak these
   // allocations so the runtime never runs their destructors at shutdown.
   static HPRegistry& registry() {
-    static HPRegistry* global_registry = new HPRegistry();
-    return *global_registry;
+    static HPRegistry instance;
+    return instance;
   }
 
-  static std::mutex& garbageMutex() {
-    static std::mutex* mtx = new std::mutex();
-    return *mtx;
-  }
-
-  static std::vector<std::vector<std::mutex>*>& garbageList() {
-    static auto* list = new std::vector<std::vector<std::mutex>*>();
-    return *list;
-  }
-  
-  // --- Per-thread HP instance ---
   static HazardPointer& getThreadHP() {
-      // This is initialized once per thread, on its first call
-      static thread_local HazardPointer* my_hp = new HazardPointer(registry());
-      return *my_hp;
+    static thread_local HazardPointer* hp = new HazardPointer(registry());
+    return *hp;
   }
+  struct RetiredNode {
+    void* ptr;
+    RetiredNode* next;
+  };
+
+  std::atomic<RetiredNode*> retired_head{nullptr};
 
   // Location will be unique for each thread
   inline static thread_local int dummy_thread_id_{};
@@ -189,23 +190,42 @@ class HashSetRefinable : public HashSetBase<T> {
   // so the last bit can be used for mark -> 0x... 1000, 1 => 0x... 1001
   std::atomic<uintptr_t> owner_{0};
 
+  class OwnerGuard {
+    std::atomic<uintptr_t>& owner_;
+    bool is_owner_ = false;
+   public:
+    OwnerGuard(std::atomic<uintptr_t>& owner, void* me) : owner_(owner) {
+      uintptr_t expected = pack(nullptr, false);
+      uintptr_t desired = pack(me, true);
+      is_owner_ = owner_.compare_exchange_strong(expected, desired,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire);
+    }
+    ~OwnerGuard() {
+      if (is_owner_) {
+        owner_.store(pack(nullptr, false), std::memory_order_release);
+      }
+    }
+    explicit operator bool() const { return is_owner_; }
+  };
+
   // Helper functions for owner field
-  uintptr_t pack(void* ptr, bool mark) {
+  static uintptr_t pack(void* ptr, bool mark) {
     return reinterpret_cast<uintptr_t>(ptr) | (mark ? 1 : 0);
   }
 
-  void* getPointer(uintptr_t packedValue) {
+  static void* getPointer(uintptr_t packedValue) {
     // clear the mark for memory alignment
     return reinterpret_cast<void*>(packedValue & ~static_cast<uintptr_t>(1));
   }
 
-  bool getMark(uintptr_t packedValue) {
+  static bool getMark(uintptr_t packedValue) {
     // return mark (LSB)
     return (packedValue & 1) == 1;
   }
 
   //Helper function to get thread token
-  void* getThreadToken() {
+  static void* getThreadToken() {
     return &dummy_thread_id_;
   }
 
@@ -256,14 +276,9 @@ class HashSetRefinable : public HashSetBase<T> {
   
   void resize() {
     // claim ownership
-    void* me = getThreadToken();
-    uintptr_t expected = pack(nullptr, false);
-    uintptr_t desire = pack(me, true);
-
-    //successful exchange needs to be visible to all threads -> acq_rel; failure at most acquire
-    if (!owner_.compare_exchange_strong(expected, desire, std::memory_order_acq_rel, std::memory_order_acquire)) {
-      // other thread is resizing
-      return;
+    OwnerGuard guard(owner_, getThreadToken());
+    if (!guard) {
+      return; // another thread is resizing
     }
 
     auto old_table_ptr = table_.load(std::memory_order_relaxed);
@@ -272,17 +287,15 @@ class HashSetRefinable : public HashSetBase<T> {
     size_t old_capacity = old_table_ptr->size();
     
     // check if other already resized
-    auto latest = table_.load(std::memory_order_relaxed);
-    if (latest->size() != old_capacity) {
-      owner_.store(pack(nullptr, false), std::memory_order_release);
-      return;
+    if (old_table_ptr != table_.load(std::memory_order_relaxed)) {
+        return; 
     }
     
     // wait for all threads complete and release locks
     quiesce();
 
     size_t new_capacity = old_capacity * 2;
-    // new pointer for resized vectors
+    // new pointer after resize
     auto new_table_ptr = new std::vector<std::vector<T>>(new_capacity);
     auto new_locks_ptr = new std::vector<std::mutex>(new_capacity);
     
@@ -297,45 +310,58 @@ class HashSetRefinable : public HashSetBase<T> {
     locks_.store(new_locks_ptr, std::memory_order_release);
 
     // return ownership
-    owner_.store(pack(nullptr, false), std::memory_order_release);
-
     reclaim(old_locks_ptr);
   }
 
   void reclaim(std::vector<std::mutex>* old_locks_ptr) {
-    // 1. Add our pointer to the global garbage list
-    {
-      std::lock_guard<std::mutex> lock(garbageMutex());
-      garbageList().push_back(old_locks_ptr);
-    }
-    
-    // 2. Get a snapshot of all currently hazardous pointers
-    std::vector<void*> hazardous_ptrs = registry().getAllHazardousPtrs();
+      // 1. Push this pointer into the global retired list (lock-free)
+      auto* node = new RetiredNode{old_locks_ptr, nullptr};
+      RetiredNode* expected = retired_head.load(std::memory_order_acquire);
+      do {
+          node->next = expected;
+      } while (!retired_head.compare_exchange_weak(
+                  expected,
+                  node,
+                  std::memory_order_release,
+                  std::memory_order_relaxed));
 
-    auto isHazardous = [&](void* candidate) {
-      for (void* hp : hazardous_ptrs) {
-        if (hp == candidate) {
-          return true;
-        }
+      // 2. Get a snapshot of all hazardous pointers
+      std::vector<void*> hazardous_ptrs = registry().getAllHazardousPtrs();
+
+      auto isHazardous = [&](void* candidate) {
+          for (void* hp : hazardous_ptrs) {
+              if (hp == candidate) return true;
+          }
+          return false;
+      };
+
+      // 3. Traverse the retired list and reclaim non-hazardous items
+      RetiredNode* prev = nullptr;
+      RetiredNode* cur  = retired_head.load(std::memory_order_acquire);
+
+      while (cur) {
+          if (!isHazardous(cur->ptr)) {
+              // Remove this node from the list
+              RetiredNode* next = cur->next;
+              if (prev) {
+                  prev->next = next;
+              } else {
+                  // update head_
+                  RetiredNode* expected_head = cur;
+                  retired_head.compare_exchange_strong(
+                      expected_head, next,
+                      std::memory_order_acq_rel,
+                      std::memory_order_relaxed);
+              }
+              delete static_cast<std::vector<std::mutex>*>(cur->ptr);
+              auto* tmp = cur;
+              cur = cur->next;
+              delete tmp;
+          } else {
+              prev = cur;
+              cur = cur->next;
+          }
       }
-      return false;
-    };
-
-    // 3. Try to clean up the *global* list
-    {
-      std::lock_guard<std::mutex> lock(garbageMutex());
-      auto& garbage = garbageList();
-      garbage.erase(
-        std::remove_if(garbage.begin(), garbage.end(),
-          [&](std::vector<std::mutex>* ptr) {
-            if (isHazardous(ptr)) {
-              return false; // keep it
-            }
-            delete ptr;
-            return true;
-          }),
-        garbage.end());
-    }
   }
 
   void quiesce() {
