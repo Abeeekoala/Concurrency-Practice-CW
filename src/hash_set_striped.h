@@ -1,12 +1,13 @@
 #ifndef HASH_SET_STRIPED_H
 #define HASH_SET_STRIPED_H
 
-#include <algorithm>  // Needed for std::find
+#include <algorithm>  // For std::find
 #include <atomic>
 #include <cassert>
 #include <functional>
+#include <memory>  // For std::unique_lock
 #include <mutex>
-#include <vector>  // Needed for std::vector
+#include <vector>
 
 #include "src/hash_set_base.h"
 
@@ -14,50 +15,40 @@ template <typename T>
 class HashSetStriped : public HashSetBase<T> {
  public:
   explicit HashSetStriped(size_t initial_capacity)
-      : table_(std::max(initial_capacity, size_t(1))),
-        // STRIPED: Fixed number of locks (doesn't grow with table)
-        // This is the key property that distinguishes striped from
-        // coarse-grained
-        mutexes_(std::max(initial_capacity, size_t(1))),
+      : table_(std::max(initial_capacity, kMinCapacity)),
+        mutexes_(std::max(initial_capacity, kMinCapacity)),
         size_(0),
-        num_locks_(std::max(initial_capacity, size_t(1))) {}
+        num_locks_(std::max(initial_capacity, kMinCapacity)) {}
 
   bool Add(T elem) final {
-    bool need_resize = false;
+    bool needs_resize = false;
 
-    {  // Scope for individual lock
-      std::scoped_lock<std::mutex> lock(
-          mutexes_[LockIndex(elem)]);  // Use unique_lock for manual unlocking
+    {  // Scope for lock lifetime management (RAII pattern)
+      std::scoped_lock lock(mutexes_[GetLockIndex(elem)]);
 
-      size_t index = BucketIndex(elem);
-      auto& bucket = table_[index];
+      auto& bucket = GetBucket(elem);
 
-      if (std::find(bucket.begin(), bucket.end(), elem) != bucket.end()) {
-        return false;  // Element already present
+      if (Contains(bucket, elem)) {
+        return false;  // Element already exists
       }
 
       bucket.push_back(elem);
-      size_.fetch_add(1);
-      // Check policy while still holding lock
-      // This prevents race where another thread modifies bucket
-      need_resize = policy();
-      // lock is released here at end of scope
-    }
+      IncrementSize();
 
-    // Resize if needed (acquires ALL locks)
-    // Must release individual lock first to avoid deadlock
-    if (need_resize) {
-      resize();
+      needs_resize = ShouldResize();
+    }  // Lock automatically released here
+
+    if (needs_resize) {
+      Resize();
     }
 
     return true;
   }
 
   bool Remove(T elem) final {
-    std::scoped_lock<std::mutex> lock(mutexes_[LockIndex(elem)]);
+    std::scoped_lock lock(mutexes_[GetLockIndex(elem)]);
 
-    size_t index = BucketIndex(elem);
-    auto& bucket = table_[index];
+    auto& bucket = GetBucket(elem);
 
     auto it = std::find(bucket.begin(), bucket.end(), elem);
     if (it == bucket.end()) {
@@ -65,72 +56,182 @@ class HashSetStriped : public HashSetBase<T> {
     }
 
     bucket.erase(it);
-    size_.fetch_sub(1);
+    DecrementSize();
     return true;
   }
 
   [[nodiscard]] bool Contains(T elem) final {
-    std::scoped_lock<std::mutex> lock(mutexes_[LockIndex(elem)]);
+    std::scoped_lock lock(mutexes_[GetLockIndex(elem)]);
 
-    size_t index = BucketIndex(elem);
-    auto& bucket = table_[index];
+    const auto& bucket = GetBucket(elem);
+    return Contains(bucket, elem);
+  }
 
+  [[nodiscard]] size_t Size() const final {
+    return size_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  // Configuration constants
+  static constexpr size_t kMinCapacity = 1;
+  static constexpr size_t kResizeFactor = 2;
+  static constexpr size_t kMaxLoadFactor = 4;
+
+  // Member variables
+  std::vector<std::vector<T>> table_;  // Hash table buckets
+  std::vector<std::mutex> mutexes_;    // Fixed-size lock array (striped)
+  std::atomic<size_t> size_;           // Total element count
+  const size_t num_locks_;             // Number of locks (constant)
+
+  //=============================================================================
+  // Hash and Index Computation
+  //=============================================================================
+
+  /**
+   * Computes the bucket index for a given element.
+   * Changes when table resizes.
+   */
+  [[nodiscard]] size_t GetBucketIndex(const T& elem) const {
+    return ComputeHash(elem) % GetCapacity();
+  }
+
+  /**
+   * Computes the lock index for a given element.
+   * NEVER changes - this is the key property of striped hashing.
+   */
+  [[nodiscard]] size_t GetLockIndex(const T& elem) const {
+    return ComputeHash(elem) % num_locks_;
+  }
+
+  /**
+   * Computes hash value for an element.
+   */
+  [[nodiscard]] size_t ComputeHash(const T& elem) const {
+    return std::hash<T>()(elem);
+  }
+
+  //=============================================================================
+  // Bucket Access
+  //=============================================================================
+
+  /**
+   * Gets the bucket for a given element (mutable).
+   */
+  [[nodiscard]] std::vector<T>& GetBucket(const T& elem) {
+    return table_[GetBucketIndex(elem)];
+  }
+
+  /**
+   * Gets the bucket for a given element (const).
+   */
+  [[nodiscard]] const std::vector<T>& GetBucket(const T& elem) const {
+    return table_[GetBucketIndex(elem)];
+  }
+
+  /**
+   * Checks if a bucket contains an element.
+   */
+  [[nodiscard]] bool Contains(const std::vector<T>& bucket,
+                              const T& elem) const {
     return std::find(bucket.begin(), bucket.end(), elem) != bucket.end();
   }
 
-  [[nodiscard]] size_t Size() const final { return size_.load(); }
+  //=============================================================================
+  // Capacity and Size Management
+  //=============================================================================
 
- private:
-  std::vector<std::vector<T>> table_;
-  std::vector<std::mutex> mutexes_;
-  std::atomic<std::size_t> size_;
-  const size_t num_locks_;  // Remember original size as locks are fixed
+  /**
+   * Returns current table capacity (number of buckets).
+   */
+  [[nodiscard]] size_t GetCapacity() const { return table_.size(); }
 
-  size_t BucketIndex(const T& elem) const {
-    return std::hash<T>()(elem) % table_.size();
+  /**
+   * Atomically increments the element count.
+   */
+  void IncrementSize() { size_.fetch_add(1, std::memory_order_relaxed); }
+
+  /**
+   * Atomically decrements the element count.
+   */
+  void DecrementSize() { size_.fetch_sub(1, std::memory_order_relaxed); }
+
+  /**
+   * Gets current element count.
+   */
+  [[nodiscard]] size_t GetSize() const {
+    return size_.load(std::memory_order_relaxed);
   }
 
-  // better naming from 'MutexIndex' to 'LockIndex' and using num_locks_
-  size_t LockIndex(const T& elem) const {
-    return std::hash<T>()(elem) % num_locks_;
+  //=============================================================================
+  // Resize Policy and Operations
+  //=============================================================================
+
+  /**
+   * Determines if table should be resized.
+   * Resize when load factor exceeds kMaxLoadFactor.
+   *
+   * Load Factor = Total Elements / Number of Buckets
+   *
+   * We use multiplication instead of division to avoid:
+   * 1. Integer truncation errors
+   * 2. Division by zero
+   * 3. Slower performance (division is ~10x slower than multiplication)
+   */
+  [[nodiscard]] bool ShouldResize() const {
+    const size_t capacity = GetCapacity();
+    const size_t current_size = GetSize();
+
+    // Check: size > capacity * kMaxLoadFactor
+    // This is equivalent to: size/capacity > kMaxLoadFactor
+    return capacity > 0 && current_size > capacity * kMaxLoadFactor;
   }
 
-  bool policy() const {
-    return table_.size() > 0 &&
-           size_.load(std::memory_order_relaxed) > table_.size() * 4;
-  }
-
-  void resize() {
-    // Create vector of unique_locks to lock all mutexes (RAII)
-    std::vector<std::unique_lock<std::mutex>> locks;
-    locks.reserve(num_locks_);
+  /**
+   * Resizes the table to double capacity and rehashes all elements.
+   *
+   * Thread Safety:
+   * - Acquires ALL locks to ensure exclusive access
+   * - Uses RAII (unique_lock) for exception safety
+   * - Rechecks resize condition after acquiring locks (guard pattern)
+   */
+  void Resize() {
+    // Step 1: Acquire all locks using RAII pattern
+    std::vector<std::unique_lock<std::mutex>> all_locks;
+    all_locks.reserve(num_locks_);
 
     for (size_t i = 0; i < num_locks_; ++i) {
-      locks.emplace_back(mutexes_[i]);  // Lock accquired on construction
+      all_locks.emplace_back(mutexes_[i]);
     }
 
-    size_t old_capacity = table_.size();
-
-    // Check again if resize still needed
-    if (size_.load() <= old_capacity * 4) {
-      return;
+    // Step 2: Check if resize is still needed (double-check pattern)
+    // Another thread might have already resized while we waited for locks
+    const size_t old_capacity = GetCapacity();
+    if (!ShouldResize()) {
+      return;  // Resize no longer needed
     }
 
-    size_t new_capacity = old_capacity * 2;
-
+    // Step 3: Create new table with doubled capacity
+    const size_t new_capacity = old_capacity * kResizeFactor;
     std::vector<std::vector<T>> old_table = std::move(table_);
     table_.resize(new_capacity);
 
-    for (const auto& bucket : old_table) {
-      for (const T& elem : bucket) {
-        size_t index = BucketIndex(elem);
-        table_[index].push_back(elem);
+    // Step 4: Rehash all elements into new table
+    RehashElements(old_table);
+
+    // Step 5: Locks automatically released when all_locks goes out of scope
+    //         This is exception-safe - even if rehashing throws, locks release
+  }
+
+  /**
+   * Rehashes all elements from old table into current table.
+   */
+  void RehashElements(const std::vector<std::vector<T>>& old_table) {
+    for (const auto& old_bucket : old_table) {
+      for (const T& elem : old_bucket) {
+        const size_t new_index = GetBucketIndex(elem);
+        table_[new_index].push_back(elem);
       }
     }
-
-    // Locks automatically released when vector goes out of scope!
-    // Even if exception thrown above, if we locked an unlocked we could be in a
-    // deadlock!
   }
 };
 
