@@ -1,16 +1,19 @@
 #ifndef HASH_SET_SEQUENTIAL_H
 #define HASH_SET_SEQUENTIAL_H
 
+#include <algorithm>
 #include <cassert>
 #include <functional>
+#include <vector>
 
 #include "src/hash_set_base.h"
 
 template <typename T>
 class HashSetSequential : public HashSetBase<T> {
  public:
+  // Ensure capacity is at least 1 to prevent division by zero
   explicit HashSetSequential(size_t initial_capacity)
-      : table_(initial_capacity), size_(0) {}
+      : table_(std::max(initial_capacity, size_t(1))), size_(0) {}
 
   bool Add(T elem) final {
     size_t index = BucketIndex(elem);
@@ -61,19 +64,23 @@ class HashSetSequential : public HashSetBase<T> {
     return std::hash<T>()(elem) % table_.size();
   }
 
-  bool policy() const { return size_ / table_.size() > 4; }
+  // Resize policy: resize when average bucket size exceeds 4
+  // Added safety check even though constructor ensures table_.size() >= 1
+  bool policy() const { return table_.size() > 0 && size_ / table_.size() > 4; }
 
+  // Resize: doubles capacity and rehashes all elements
   void resize() {
     size_t old_capacity = table_.size();
     size_t new_capacity = old_capacity * 2;
 
-    std::vector<std::vector<T>> old_table = table_;
-    table_.resize(new_capacity);
-    for (size_t i = 0; i < new_capacity; i++) {
-      table_[i] = std::vector<T>();
-    }
+    // Move old table efficiently (no copy)
+    std::vector<std::vector<T>> old_table = std::move(table_);
 
-    for (auto& bucket : old_table) {
+    // Create new table with doubled capacity
+    table_.resize(new_capacity);
+
+    // Rehash all elements from old table
+    for (const auto& bucket : old_table) {
       for (const T& elem : bucket) {
         size_t index = BucketIndex(elem);
         table_[index].push_back(elem);
