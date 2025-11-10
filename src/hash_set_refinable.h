@@ -1,7 +1,7 @@
 #ifndef HASH_SET_REFINABLE_H
 #define HASH_SET_REFINABLE_H
 
-#include <algorithm>
+#include <algorithm> // For std::find
 #include <cassert>
 #include <functional>
 #include <mutex>
@@ -42,7 +42,7 @@ class HPRegistry {
     node->hp.store(nullptr, std::memory_order_release);
   }
 
-  // for resize() to get a list of all active pointers
+  // for Resize() to get a list of all active pointers
   std::vector<void*> getAllHazardousPtrs() {
     std::vector<void*> result;
     HazardNode* current = head_.load(std::memory_order_acquire);
@@ -70,7 +70,8 @@ class HazardPointer {
   
   public:
   explicit HazardPointer(HPRegistry& registry)
-      : registry_(registry), node_(registry_.registerHP()) {}
+      : registry_(registry), 
+        node_(registry_.registerHP()) {}
 
   ~HazardPointer() {
     registry_.unregisterHP(node_);
@@ -89,9 +90,9 @@ template <typename T>
 class HashSetRefinable : public HashSetBase<T> {
  public:
   explicit HashSetRefinable(size_t initial_capacity) {
-
-    table_.store(new std::vector<std::vector<T>>(initial_capacity), std::memory_order_relaxed);
-    locks_.store(new std::vector<std::mutex>(initial_capacity), std::memory_order_relaxed);
+    const size_t capacity = std::max(initial_capacity, kMinCapacity);
+    table_.store(new std::vector<std::vector<T>>(capacity), std::memory_order_relaxed);
+    locks_.store(new std::vector<std::mutex>(capacity), std::memory_order_relaxed);
     
     size_.store(0);
     owner_.store(pack(nullptr, false));
@@ -104,34 +105,36 @@ class HashSetRefinable : public HashSetBase<T> {
     delete locks_.load();
   }
 
+  // Locks the relevant bucket, inserts if absent, and may trigger a resize
   bool Add(T elem) final {
-    std::unique_lock<std::mutex> lock = acquire(elem);
+    std::unique_lock<std::mutex> lock = Acquire(elem);
 
     auto curTable = table_.load(std::memory_order_relaxed);
-    size_t index = BucketIndex(elem, curTable->size());
-    auto& bucket = (*curTable)[index];
-
-    if (std::find(bucket.begin(), bucket.end(), elem) != bucket.end()) {
-      return false;  // Element already present
+    auto& bucket = GetBucket(curTable, elem);
+    
+    if (BucketContains(bucket, elem)) {
+      return false;  // Element already exists
     }
-
+    
+    bool needs_resize = false;
     bucket.push_back(elem);
-    size_.fetch_add(1);
+    IncrementSize();
 
-    if (policy()) {
+    needs_resize = ShouldResize();
+
+    if (needs_resize) {
       lock.unlock();
-      resize();
+      Resize();
     }
 
     return true;
   }
-
+  // Locks the bucket, erases the element when found, and updates the size.
   bool Remove(T elem) final {
-    std::unique_lock<std::mutex> lock = acquire(elem);
+    std::unique_lock<std::mutex> lock = Acquire(elem);
 
     auto curTable = table_.load(std::memory_order_relaxed);
-    size_t index = BucketIndex(elem, curTable->size());
-    auto& bucket = (*curTable)[index];
+    auto& bucket = GetBucket(curTable, elem);
 
     auto it = std::find(bucket.begin(), bucket.end(), elem);
     if (it == bucket.end()) {
@@ -139,56 +142,60 @@ class HashSetRefinable : public HashSetBase<T> {
     }
 
     bucket.erase(it);
-    size_.fetch_sub(1);
+    DecrementSize();
     return true;
   }
-
+  
+  // Acquires the bucket lock to safely check membership.
   [[nodiscard]] bool Contains(T elem) final {
-    std::unique_lock<std::mutex> lock = acquire(elem);
+    std::unique_lock<std::mutex> lock = Acquire(elem);
 
     auto curTable = table_.load(std::memory_order_relaxed);
-    size_t index = BucketIndex(elem, curTable->size());
-    auto& bucket = (*curTable)[index];
+    auto& bucket = GetBucket(curTable, elem);
 
-    return std::find(bucket.begin(), bucket.end(), elem) != bucket.end();
+    return BucketContains(bucket, elem);
   }
 
  [[nodiscard]] size_t Size() const final {
-    return size_.load();
+    return size_.load(std::memory_order_relaxed);
   }
  private:
-  // Accessors for shared hazard pointer state. We intentionally leak these
-  // allocations so the runtime never runs their destructors at shutdown.
-  static HPRegistry& registry() {
+ // Configuration constants
+  static constexpr size_t kMinCapacity = 1;
+  static constexpr size_t kResizeFactor = 2;
+  static constexpr size_t kMaxLoadFactor = 4;
+
+  // Tracks deferred reclamation targets (old lock arrays)
+  struct RetiredNode {
+    void* ptr;
+    RetiredNode* next;
+  };
+  
+  // Member variabes
+  std::atomic<RetiredNode*> retired_head{nullptr};            // linked list of deferred reclamation targets
+  std::atomic<std::vector<std::vector<T>>*> table_{nullptr};  // Hash table buckets
+  std::atomic<std::vector<std::mutex>*> locks_{nullptr};      // Lock array
+  std::atomic<std::size_t> size_{0};                          // Total element count
+  std::atomic<uintptr_t> owner_{0};                           // Owner field (thread_ptr, mark): Bit steal hack
+
+  // thread_local member variables
+  inline static thread_local int dummy_thread_id_{};   // Location will be unique for each thread
+
+  //Helper function to get thread token
+  static void* GetThreadToken() {
+    return &dummy_thread_id_;
+  }
+
+  // Hazard pointer helper functions
+  static HPRegistry& Registry() {
     static HPRegistry instance;
     return instance;
   }
 
   static HazardPointer& getThreadHP() {
-    static thread_local HazardPointer* hp = new HazardPointer(registry());
+    static thread_local HazardPointer* hp = new HazardPointer(Registry());
     return *hp;
   }
-  struct RetiredNode {
-    void* ptr;
-    RetiredNode* next;
-  };
-
-  std::atomic<RetiredNode*> retired_head{nullptr};
-
-  // Location will be unique for each thread
-  inline static thread_local int dummy_thread_id_{};
-
-  std::atomic<std::vector<std::vector<T>>*> table_{nullptr};
-  std::atomic<std::vector<std::mutex>*> locks_{nullptr};
-
-  std::atomic<std::size_t> size_{0};
-  
-  // Bit stealing:
-  // pack bool:mark with pointer to thread to achieve lock free atomic
-  // pointer usually ends with 2 (or 3) bytes of zeros,
-  // depending on the memory alignment,
-  // so the last bit can be used for mark -> 0x... 1000, 1 => 0x... 1001
-  std::atomic<uintptr_t> owner_{0};
 
   class OwnerGuard {
     std::atomic<uintptr_t>& owner_;
@@ -209,6 +216,11 @@ class HashSetRefinable : public HashSetBase<T> {
     explicit operator bool() const { return is_owner_; }
   };
 
+  // Owner Bit stealing:
+  // pack bool:mark with pointer to thread to achieve lock free atomic
+  // pointer usually ends with 2 (or 3) bits of zeros,
+  // depending on the memory alignment,
+  // making the LSB available for mark -> 0x... 1000, 1 => 0x... 1001
   // Helper functions for owner field
   static uintptr_t pack(void* ptr, bool mark) {
     return reinterpret_cast<uintptr_t>(ptr) | (mark ? 1 : 0);
@@ -223,20 +235,19 @@ class HashSetRefinable : public HashSetBase<T> {
     // return mark (LSB)
     return (packedValue & 1) == 1;
   }
+  
+  //=============================================================================
+  // Lock Bucket for element
+  //=============================================================================
 
-  //Helper function to get thread token
-  static void* getThreadToken() {
-    return &dummy_thread_id_;
-  }
-
-  std::unique_lock<std::mutex> acquire(const T& elem) {
+  std::unique_lock<std::mutex> Acquire(const T& elem) {
     HazardPointer& hp = getThreadHP();
 
     while (true) {
       // 1. Check for resize (fast spin, no RMW)
       do {
         uintptr_t packed = owner_.load(std::memory_order_acquire);
-        if (getMark(packed) && getPointer(packed) != getThreadToken()) {
+        if (getMark(packed) && getPointer(packed) != GetThreadToken()) {
           std::this_thread::yield();
         } else {
           break; // Not resizing, or we are the resizer
@@ -259,7 +270,7 @@ class HashSetRefinable : public HashSetBase<T> {
       void* curOwner = getPointer(packedAfter);
       bool isMarked = getMark(packedAfter);
 
-      if ((!isMarked || curOwner == getThreadToken()) &&
+      if ((!isMarked || curOwner == GetThreadToken()) &&
             locks_.load(std::memory_order_acquire) == curLocks){
         hp.clear();
         return lock;
@@ -268,15 +279,117 @@ class HashSetRefinable : public HashSetBase<T> {
       hp.clear();
     }
   }
-  
-  bool policy() const { 
-    auto curTable = table_.load(std::memory_order_relaxed);  
-    return size_.load() / curTable->size() > 4; 
+
+  //=============================================================================
+  // Capacity and Size Management
+  //=============================================================================
+
+  /**
+   * Returns current table capacity (number of buckets).
+   */
+  [[nodiscard]] size_t GetCapacity() const {
+    auto* current_table = table_.load(std::memory_order_acquire);
+    return current_table ? current_table->size() : 0;
   }
-  
-  void resize() {
-    // claim ownership
-    OwnerGuard guard(owner_, getThreadToken());
+
+  /**
+   * Atomically increments the element count.
+   */
+  void IncrementSize() { size_.fetch_add(1, std::memory_order_relaxed); }
+
+  /**
+   * Atomically decrements the element count.
+   */
+  void DecrementSize() { size_.fetch_sub(1, std::memory_order_relaxed); }
+
+  /**
+   * Gets current element count.
+   */
+  [[nodiscard]] size_t GetSize() const {
+    return size_.load(std::memory_order_relaxed);
+  }
+
+  //=============================================================================
+  // Hash and Index Computation
+  //=============================================================================
+
+  /**
+   * Computes hash value for an element.
+   */
+  [[nodiscard]] size_t ComputeHash(const T& elem) const {
+    return std::hash<T>()(elem);
+  }
+
+  /**
+   * Helper to compute the bucket index for a given element and capacity.
+   */
+  [[nodiscard]] size_t BucketIndex(const T& elem, size_t capacity) const {
+    assert(capacity > 0);
+    return ComputeHash(elem) % capacity;
+  }
+
+  /**
+   * Helper to compute the mutex index for a given element and number of locks.
+   */
+  [[nodiscard]] size_t MutexIndex(const T& elem, size_t num_locks) const {
+    assert(num_locks > 0);
+    return ComputeHash(elem) % num_locks;
+  }
+
+  //=============================================================================
+  // Bucket Access
+  //=============================================================================
+
+  /**
+   * Gets the bucket for a given element (mutable).
+   */
+  [[nodiscard]] std::vector<T>& GetBucket(std::vector<std::vector<T>>* curTable, const T& elem) {
+    assert(curTable != nullptr);
+    return (*curTable)[BucketIndex(elem, curTable->size())];
+  }
+  /**
+   * Gets the bucket for a given element (const).
+   */
+  [[nodiscard]] const std::vector<T>& GetBucket(
+      const std::vector<std::vector<T>>* curTable, const T& elem) const {
+    assert(curTable != nullptr);
+    return (*curTable)[BucketIndex(elem, curTable->size())];
+  }
+
+  /**
+   * Checks if a bucket contains an element.
+   */
+  [[nodiscard]] bool BucketContains(const std::vector<T>& bucket, const T& elem) const {
+    return std::find(bucket.begin(), bucket.end(), elem) != bucket.end();
+  }
+
+  //=============================================================================
+  // Resize Policy and Operations
+  //=============================================================================
+
+  /**
+   * Determines if table should be resized.
+   * Resize when load factor exceeds kMaxLoadFactor.
+   *
+   * Load Factor = Total Elements / Number of Buckets
+   *
+   * We use multiplication instead of division to avoid:
+   * 1. Integer truncation errors
+   * 2. Division by zero
+   * 3. Slower performance (division is ~10x slower than multiplication)
+   */
+  [[nodiscard]] bool ShouldResize() const {
+    const size_t capacity = GetCapacity();
+    const size_t current_size = GetSize();
+
+    // Check: size > capacity * kMaxLoadFactor
+    // This is equivalent to: size/capacity > kMaxLoadFactor
+    return capacity > 0 && current_size > capacity * kMaxLoadFactor;
+  }
+
+  void Resize() {
+    // Resizer claims ownership
+    OwnerGuard guard(owner_, GetThreadToken());
     if (!guard) {
       return; // another thread is resizing
     }
@@ -292,9 +405,9 @@ class HashSetRefinable : public HashSetBase<T> {
     }
     
     // wait for all threads complete and release locks
-    quiesce();
+    Quiesce();
 
-    size_t new_capacity = old_capacity * 2;
+    size_t new_capacity = std::max(old_capacity * 2, kMinCapacity);
     // new pointer after resize
     auto new_table_ptr = new std::vector<std::vector<T>>(new_capacity);
     auto new_locks_ptr = new std::vector<std::mutex>(new_capacity);
@@ -310,10 +423,13 @@ class HashSetRefinable : public HashSetBase<T> {
     locks_.store(new_locks_ptr, std::memory_order_release);
 
     // return ownership
-    reclaim(old_locks_ptr);
+    Reclaim(old_locks_ptr);
   }
-
-  void reclaim(std::vector<std::mutex>* old_locks_ptr) {
+  
+  /**
+   * Reclaim old lock array once no hazard pointers reference it.
+   */
+  void Reclaim(std::vector<std::mutex>* old_locks_ptr) {
       // 1. Push this pointer into the global retired list (lock-free)
       auto* node = new RetiredNode{old_locks_ptr, nullptr};
       RetiredNode* expected = retired_head.load(std::memory_order_acquire);
@@ -326,7 +442,7 @@ class HashSetRefinable : public HashSetBase<T> {
                   std::memory_order_relaxed));
 
       // 2. Get a snapshot of all hazardous pointers
-      std::vector<void*> hazardous_ptrs = registry().getAllHazardousPtrs();
+      std::vector<void*> hazardous_ptrs = Registry().getAllHazardousPtrs();
 
       auto isHazardous = [&](void* candidate) {
           for (void* hp : hazardous_ptrs) {
@@ -364,7 +480,8 @@ class HashSetRefinable : public HashSetBase<T> {
       }
   }
 
-  void quiesce() {
+  // Waits until all bucket locks are observed free before resizing proceeds.
+  void Quiesce() {
     auto curLocks = locks_.load(std::memory_order_acquire);
 
     for (std::mutex& lock : *curLocks) {
@@ -376,14 +493,6 @@ class HashSetRefinable : public HashSetBase<T> {
       // succeed: release lock
       lock.unlock();
     }
-  }
-
-  size_t BucketIndex(const T& elem, const size_t capacity) const {
-    return std::hash<T>()(elem) % capacity;
-  }
-
-  size_t MutexIndex(const T& elem, const size_t lock_count) const {
-    return std::hash<T>()(elem) % lock_count;
   }
 
 };

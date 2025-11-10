@@ -5,7 +5,6 @@
 #include <atomic>
 #include <cassert>
 #include <functional>
-#include <memory>  // For std::unique_lock
 #include <mutex>
 #include <vector>
 
@@ -28,7 +27,7 @@ class HashSetStriped : public HashSetBase<T> {
 
       auto& bucket = GetBucket(elem);
 
-      if (Contains(bucket, elem)) {
+      if (BucketContains(bucket, elem)) {
         return false;  // Element already exists
       }
 
@@ -64,7 +63,7 @@ class HashSetStriped : public HashSetBase<T> {
     std::scoped_lock lock(mutexes_[GetLockIndex(elem)]);
 
     const auto& bucket = GetBucket(elem);
-    return Contains(bucket, elem);
+    return BucketContains(bucket, elem);
   }
 
   [[nodiscard]] size_t Size() const final {
@@ -131,7 +130,7 @@ class HashSetStriped : public HashSetBase<T> {
   /**
    * Checks if a bucket contains an element.
    */
-  [[nodiscard]] bool Contains(const std::vector<T>& bucket,
+  [[nodiscard]] bool BucketContains(const std::vector<T>& bucket,
                               const T& elem) const {
     return std::find(bucket.begin(), bucket.end(), elem) != bucket.end();
   }
