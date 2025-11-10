@@ -78,7 +78,7 @@ class HashSetCoarseGrained : public HashSetBase<T> {
 
   // Resize policy: resize when average bucket size exceeds 4
   // Added safety check even though constructor ensures table_.size() >= 1
-  bool policy() const { return table_.size() > 0 && size_ / table_.size() > 4; }
+  bool policy() const { return table_.size() > 0 && size_ > table_.size() *4; }
 
   // Resize: doubles capacity and rehashes all elements
   // Called from Add() while mutex_ is already held (no re-locking needed)
